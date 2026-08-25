@@ -6,11 +6,33 @@ Handles /pw route for streaming video content with CORS & token support
 import os
 import logging
 import time
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, parse_qsl
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
 from datetime import datetime
+
+# Global session for cookie persistence across requests
+_session = None
+
+def get_session():
+    """Get or create a requests session with retry strategy."""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        # Retry strategy for transient failures
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        _session.mount("http://", adapter)
+        _session.mount("https://", adapter)
+    return _session
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -60,34 +82,54 @@ def extract_token_from_url(url: str) -> str:
 
 def fetch_upstream_with_retry(url: str, token: str = ""):
     """
-    Fetch upstream with retry logic for transient failures.
-    - Preserves ALL query parameters from original URL
-    - Forwards cookies and CloudFront authentication
+    Fetch upstream using persistent session (for CloudFront cookies).
+    - Preserves ALL query parameters and cookies
+    - Handles CloudFront signed URLs properly
     - 2xx, 4xx: Final (don't retry)
-    - 5xx, connection errors: Retry with backoff
+    - 5xx, 403, 401: Retry with backoff
     """
+    session = get_session()
     headers = dict(UPSTREAM_HEADERS)
     
-    # Add token to headers if provided
+    # Add token to Authorization header if provided
     if token:
         headers["Authorization"] = f"Bearer {token}"
+        headers["X-Auth-Token"] = token
     
-    # Forward all cookies from client request
+    # Forward ALL client cookies (critical for CloudFront)
+    client_cookies = {}
     if request.headers.get("Cookie"):
+        for cookie_part in request.headers.get("Cookie", "").split(";"):
+            if "=" in cookie_part:
+                k, v = cookie_part.strip().split("=", 1)
+                client_cookies[k.strip()] = v.strip()
         headers["Cookie"] = request.headers["Cookie"]
     
-    # Forward CloudFront specific headers if present
-    if request.headers.get("CloudFront-Viewer-Country"):
-        headers["CloudFront-Viewer-Country"] = request.headers["CloudFront-Viewer-Country"]
+    # Forward CloudFront & security headers
+    cf_headers = [
+        "CloudFront-Viewer-Country",
+        "CloudFront-Viewer-Country-Region", 
+        "CloudFront-Viewer-Country-Region-Name",
+        "CloudFront-Viewer-Http-Version",
+        "CloudFront-Viewer-Latitude",
+        "CloudFront-Viewer-Longitude",
+        "CloudFront-Viewer-Metro-Code",
+        "CloudFront-Viewer-Time-Zone",
+        "User-Agent",
+        "Referer"
+    ]
+    for cf_header in cf_headers:
+        if request.headers.get(cf_header):
+            headers[cf_header] = request.headers[cf_header]
     
-    # Add Range header if client requested it
+    # Add Range header if client requested partial content
     if request.headers.get("Range"):
         headers["Range"] = request.headers["Range"]
     
-    # Add User-Agent variations for better compatibility
-    headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    # Enhanced user agent for compatibility
+    headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
     
-    # Add additional headers for streaming
+    # Streaming headers
     headers["Accept-Ranges"] = "bytes"
     headers["Cache-Control"] = "no-cache"
     headers["Pragma"] = "no-cache"
@@ -100,51 +142,59 @@ def fetch_upstream_with_retry(url: str, token: str = ""):
         try:
             logger.info(f"Fetch attempt {attempt + 1}/{UPSTREAM_MAX_RETRIES + 1}: {url[:100]}...")
             
-            response = requests.get(
+            # Use session for cookie persistence
+            response = session.get(
                 url,
                 headers=headers,
                 timeout=UPSTREAM_TIMEOUT,
                 allow_redirects=True,
                 stream=True,
-                verify=True  # SSL verification enabled
+                verify=True,
+                cookies=client_cookies if client_cookies else None
             )
             
             last_response = response
             
             # Log response details
-            logger.info(f"Response status: {response.status_code}, Content-Type: {response.headers.get('Content-Type', 'unknown')}")
+            logger.info(f"Response status: {response.status_code}, CT: {response.headers.get('Content-Type', 'unknown')}, Size: {response.headers.get('Content-Length', 'unknown')}")
             
-            # Don't retry on 2xx or 4xx
-            if 200 <= response.status_code < 500:
-                if response.status_code >= 400:
-                    # Log the error content for debugging
-                    try:
-                        error_content = response.text[:500]
-                        logger.warning(f"Status {response.status_code}: {error_content}")
-                    except:
-                        pass
-                
-                logger.info(f"Status {response.status_code} (final, no retry)")
+            # Log any Set-Cookie headers (important for CloudFront)
+            if response.headers.get("Set-Cookie"):
+                logger.info(f"Set-Cookie received: {response.headers.get('Set-Cookie')[:100]}")
+            
+            # Success: 2xx
+            if 200 <= response.status_code < 300:
+                logger.info(f"✅ Status {response.status_code} (success)")
                 return response
             
-            # Retry on 5xx
+            # Client errors: 4xx (except 403/401)
+            if 400 <= response.status_code < 500:
+                if response.status_code in [401, 403]:
+                    # Auth errors - might be temporary, retry
+                    logger.warning(f"Auth error {response.status_code}, retrying (attempt {attempt + 1}/{UPSTREAM_MAX_RETRIES + 1})...")
+                    last_status = response.status_code
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                else:
+                    # Other 4xx - don't retry
+                    logger.warning(f"✗ Status {response.status_code} (client error, no retry)")
+                    return response
+            
+            # Server errors: 5xx
             if response.status_code >= 500:
                 last_status = response.status_code
-                logger.warning(f"Status {response.status_code}, retrying (attempt {attempt + 1}/{UPSTREAM_MAX_RETRIES + 1})...")
-                import time
-                time.sleep(0.5 * (attempt + 1))  # Backoff
+                logger.warning(f"Server error {response.status_code}, retrying (attempt {attempt + 1}/{UPSTREAM_MAX_RETRIES + 1})...")
+                time.sleep(0.5 * (attempt + 1))
                 continue
                 
         except requests.exceptions.Timeout as e:
-            logger.warning(f"Timeout on attempt {attempt + 1}, retrying...")
-            last_exc = f"Timeout: {str(e)}"
-            import time
+            logger.warning(f"Timeout attempt {attempt + 1}, retrying...")
+            last_exc = f"Timeout"
             time.sleep(0.5 * (attempt + 1))
             continue
         except requests.exceptions.ConnectionError as e:
-            logger.warning(f"Connection error: {e}, retrying...")
-            last_exc = f"Connection: {str(e)}"
-            import time
+            logger.warning(f"Connection error attempt {attempt + 1}, retrying: {e}")
+            last_exc = "ConnectionError"
             time.sleep(0.5 * (attempt + 1))
             continue
         except Exception as e:
@@ -153,7 +203,7 @@ def fetch_upstream_with_retry(url: str, token: str = ""):
             break
     
     # All retries exhausted
-    error_msg = f"Failed after {UPSTREAM_MAX_RETRIES + 1} attempts"
+    error_msg = f"Fetch failed after {UPSTREAM_MAX_RETRIES + 1} attempts"
     if last_status:
         error_msg += f" (last status: {last_status})"
     if last_exc:
@@ -161,8 +211,9 @@ def fetch_upstream_with_retry(url: str, token: str = ""):
     
     logger.error(error_msg)
     
-    # If we have a last response, return it (even if error) so client can see the actual error
+    # Return last response if we have one
     if last_response:
+        logger.warning(f"Returning last response: {last_response.status_code}")
         return last_response
     
     raise Exception(error_msg)
