@@ -17,11 +17,5 @@
       "dest": "pw_main.py"
     }
   ],
-  "env": {
-    "DEBUG": {
-      "description": "Enable debug mode",
-      "default": "false"
-    }
-  },
   "regions": ["iad1", "sfo1", "blr1"]
 }
