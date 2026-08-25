@@ -23,12 +23,5 @@
       "default": "false"
     }
   },
-  "regions": ["iad1", "sfo1", "blr1"],
-  "functions": {
-    "pw_main.py": {
-      "maxDuration": 300,
-      "memory": 3008,
-      "timeout": 300
-    }
-  }
+  "regions": ["iad1", "sfo1", "blr1"]
 }
