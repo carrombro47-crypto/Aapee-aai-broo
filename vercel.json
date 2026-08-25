@@ -17,5 +17,5 @@
       "dest": "pw_main.py"
     }
   ],
-  "regions": ["iad1", "sfo1", "blr1"]
+  "regions": ["bom1"]
 }
