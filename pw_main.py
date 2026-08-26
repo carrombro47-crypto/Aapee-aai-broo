@@ -276,14 +276,14 @@ def fetch_upstream_with_retry(url: str, token: str = ""):
 @app.route('/pw', methods=['GET', 'HEAD', 'OPTIONS'])
 def download_video():
     """
-    Main video download/stream endpoint with enhanced cookie & auth handling.
+    DOWNLOAD-ONLY endpoint (NO STREAMING).
+    - Downloads video/MPD/m3u8 files directly
+    - Returns complete file for client to download
+    - Handles CloudFront signed URLs with proper auth
     
     Query Parameters:
-    - url (required): Complete video URL (MPD, m3u8, etc.)
+    - url (required): Complete video/MPD URL
     - token (optional): JWT token for authentication
-    
-    Example:
-    /pw?url=https://domain.com/path/master.mpd&parentId=123&childId=456&token=xyz
     """
     
     # Handle CORS preflight
@@ -303,7 +303,21 @@ def download_video():
         
         # Log request (sanitize for privacy)
         url_preview = video_url[:120] + ("..." if len(video_url) > 120 else "")
-        logger.info(f"Download request: {url_preview}")
+        logger.info(f"📥 DOWNLOAD request: {url_preview}")
+        
+        # Detect file type
+        file_ext = ""
+        if ".mpd" in video_url.lower():
+            file_ext = "mpd"
+            file_type = "DASH Manifest"
+        elif ".m3u8" in video_url.lower() or "playlist" in video_url.lower():
+            file_ext = "m3u8"
+            file_type = "HLS Playlist"
+        else:
+            file_ext = "bin"
+            file_type = "Video/Binary"
+        
+        logger.info(f"File type detected: {file_type} ({file_ext})")
         
         # Extract token from URL or query params
         token = request.args.get('token', '').strip()
@@ -311,107 +325,97 @@ def download_video():
             token = extract_token_from_url(video_url)
         
         if token:
-            logger.info(f"Token auth detected (length: {len(token)})")
+            logger.info(f"✔ Token auth detected (length: {len(token)})")
         
         # Fetch upstream with retry
         try:
-            logger.info("Initiating upstream fetch...")
+            logger.info("📡 Fetching from upstream...")
             upstream = fetch_upstream_with_retry(video_url, token)
-            logger.info(f"Upstream response: {upstream.status_code}")
+            logger.info(f"✔ Upstream response received: {upstream.status_code}")
         except Exception as e:
-            logger.error(f"Upstream fetch failed: {e}", exc_info=True)
+            logger.error(f"❌ Upstream fetch failed: {e}", exc_info=True)
             return jsonify({
-                "error": "Failed to fetch video from upstream",
+                "error": "Failed to fetch from upstream",
                 "details": str(e),
                 "type": type(e).__name__
             }), 502
         
-        # Return upstream error response to client
+        # Handle upstream errors
         if upstream.status_code >= 400:
-            logger.warning(f"Upstream returned error: {upstream.status_code}")
+            logger.error(f"❌ Upstream error: {upstream.status_code}")
             
-            # Special handling for CloudFront 403
-            if upstream.status_code == 403:
-                logger.error("⚠️ CLOUDFRONT 403 - Possible causes:")
-                logger.error("  1. Signed URL expired (Token/Policy lifetime exceeded)")
-                logger.error("  2. Key-Pair-ID mismatch")
-                logger.error("  3. IP/Region restriction")
-                logger.error("  4. Invalid Signature")
-                try:
-                    error_preview = upstream.text[:500] if hasattr(upstream, 'text') else str(upstream.content[:500])
-                    logger.error(f"  Error detail: {error_preview}")
-                except:
-                    pass
+            # Special handling for CloudFront 403/401
+            if upstream.status_code in [401, 403]:
+                logger.error("⚠️ CLOUDFRONT AUTH FAILED")
+                logger.error(f"  Reason: Token expired, Key-Pair-ID missing, or signature invalid")
             
-            # Log error content for debugging (limit to 500 chars)
+            # Log error content
             try:
-                error_preview = upstream.text[:500] if hasattr(upstream, 'text') else str(upstream.content[:500])
-                logger.error(f"Upstream error response: {error_preview}")
+                error_text = upstream.text[:300]
+                logger.error(f"  Response: {error_text}")
             except:
                 pass
             
-            # Forward upstream error exactly as-is to client
+            # Return upstream error to client
             return upstream.content, upstream.status_code, dict(upstream.headers)
         
-        # Success - stream response to client
-        logger.info(f"Streaming success (status {upstream.status_code}, CT: {upstream.headers.get('Content-Type', 'unknown')})")
+        # ✅ SUCCESS - Download mode (not streaming)
+        logger.info(f"✅ Downloading {file_type}...")
         
-        def generate():
-            """Stream content in chunks."""
-            bytes_sent = 0
-            try:
-                for chunk in upstream.iter_content(chunk_size=CHUNK_SIZE):
-                    if chunk:
-                        bytes_sent += len(chunk)
-                        yield chunk
-                logger.info(f"Stream complete: {bytes_sent} bytes")
-            except GeneratorExit:
-                logger.info(f"Client disconnected after {bytes_sent} bytes")
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
-                raise
-            finally:
-                try:
-                    upstream.close()
-                except:
-                    pass
+        # Read entire content (this is DOWNLOAD, not stream)
+        try:
+            content = upstream.content
+            content_length = len(content)
+            logger.info(f"✅ Downloaded {content_length} bytes")
+        except Exception as e:
+            logger.error(f"❌ Error reading content: {e}")
+            return jsonify({
+                "error": "Failed to read file content",
+                "details": str(e)
+            }), 500
         
         # Prepare response headers
         response_headers = dict(upstream.headers)
         
-        # CORS headers - allow all origins
+        # CORS headers
         response_headers["Access-Control-Allow-Origin"] = "*"
         response_headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
-        response_headers["Access-Control-Allow-Credentials"] = "true"
-        response_headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Content-Type, Accept-Ranges"
+        response_headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Type, Content-Disposition"
         
-        # Streaming & caching headers
-        response_headers["Accept-Ranges"] = "bytes"
-        response_headers["Cache-Control"] = "public, max-age=3600"
+        # Force download (not inline display)
+        response_headers["Content-Disposition"] = f'attachment; filename="video.{file_ext}"'
+        response_headers["Content-Length"] = str(content_length)
         
-        # Remove sensitive server identification headers
-        sensitive_headers = ["Server", "X-Amzn-RequestId", "X-Cache", "Via", "X-Frame-Options", "X-XSS-Protection"]
-        for header in sensitive_headers:
+        # Remove streaming headers (not needed for download)
+        response_headers.pop("Content-Range", None)
+        response_headers.pop("Accept-Ranges", None)
+        
+        # Remove sensitive headers
+        for header in ["Server", "X-Amzn-RequestId", "X-Cache", "Via"]:
             response_headers.pop(header, None)
         
-        # Determine and set content type based on URL
-        content_type = upstream.headers.get('Content-Type', 'application/octet-stream')
-        if 'mpd' in video_url.lower():
-            content_type = 'application/dash+xml'
-        elif 'm3u8' in video_url.lower() or 'playlist' in video_url.lower():
-            content_type = 'application/vnd.apple.mpegurl'
+        # Set proper content type
+        if file_ext == "mpd":
+            content_type = "application/dash+xml"
+        elif file_ext == "m3u8":
+            content_type = "application/vnd.apple.mpegurl"
+        else:
+            content_type = "video/mp4"
         
-        logger.info(f"Sending with Content-Type: {content_type}, Size: {response_headers.get('Content-Length', 'unknown')}")
+        response_headers["Content-Type"] = content_type
         
+        logger.info(f"📥 Sending file download: {content_length} bytes as {content_type}")
+        
+        # Return complete file (download mode)
         return Response(
-            generate(),
-            status=upstream.status_code,
+            content,
+            status=200,
             headers=response_headers,
             mimetype=content_type
         )
     
     except Exception as e:
-        logger.error(f"Unhandled error in /pw endpoint: {e}", exc_info=True)
+        logger.error(f"❌ Unhandled error: {type(e).__name__}: {e}", exc_info=True)
         return jsonify({
             "error": "Internal server error",
             "details": str(e),
